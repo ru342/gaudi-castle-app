@@ -8,9 +8,15 @@ from PIL import Image
 
 st.set_page_config(layout="centered")
 
-anchors = [{"x": x, "y": 0.0} for x in [-15.0, -7.5, 0.0, 7.5, 15.0]]
+# --- 設定値 ---
+NUM_ANCHORS = 8
+# -17.5 から 17.5 の間に等間隔で8個の点を配置
+anchors_x = np.linspace(-17.5, 17.5, NUM_ANCHORS)
+anchors = [{"x": float(x), "y": 0.0} for x in anchors_x]
+
 NUM_NEW_NODES = 41 
 NUM_INTERNAL_NODES = NUM_NEW_NODES - 2
+MID_NODE_OFFSET = NUM_INTERNAL_NODES // 2 # ひものちょうど真ん中のインデックス
 
 # --- サイドバー：API設定とプロンプト ---
 st.sidebar.title("⚙️ AI生成設定")
@@ -23,6 +29,16 @@ user_prompt = st.sidebar.text_area(
     value="A majestic medieval fantasy castle designed by Antoni Gaudi, intricate stone carving, sunset lighting, epic scale, highly detailed, masterpiece, 8k resolution",
     height=150
 )
+
+# --- 【変更】ノード番号をわかりやすい名前に変換する関数 ---
+def format_node_label(idx):
+    if idx < NUM_ANCHORS:
+        positions = ["一番左", "左から2番目", "左から3番目", "中央の左", "中央の右", "右から3番目", "右から2番目", "一番右"]
+        return f"天井 {idx + 1} ({positions[idx]})"
+    else:
+        # ひもの頂点は番号で呼ぶ
+        s_id = (idx - NUM_ANCHORS) // NUM_INTERNAL_NODES
+        return f"ひも {s_id + 1} の頂点"
 
 # --- 使用中のノードを動的に取得する関数 ---
 def get_used_nodes():
@@ -77,12 +93,12 @@ def add_string(idx1, idx2):
 
 # --- 共通関数：次につなぐ候補点を選定する ---
 def update_next_nodes():
-    candidates = [0, 1, 2, 3, 4]
+    candidates = list(range(NUM_ANCHORS)) 
     if "string_data" in st.session_state:
         for s in st.session_state.string_data:
             if not s.get("is_deleted", False):
-                base = 5 + s["id"] * NUM_INTERNAL_NODES
-                candidates.extend([base + 9, base + 19, base + 29])
+                base = NUM_ANCHORS + s["id"] * NUM_INTERNAL_NODES
+                candidates.append(base + MID_NODE_OFFSET)
         
     used_nodes = get_used_nodes()
     available_candidates = [c for c in candidates if c not in used_nodes]
@@ -91,7 +107,7 @@ def update_next_nodes():
     else:
         st.session_state.next_nodes = None
 
-# --- AI画像生成関数 (Stability AI 本番用) ---
+# --- AI画像生成関数 ---
 def generate_castle_image(image_bytes, prompt, key):
     if not key:
         time.sleep(1.5)
@@ -102,20 +118,14 @@ def generate_castle_image(image_bytes, prompt, key):
         return buf.getvalue()
 
     st.info("🌐 Stability AIのサーバーに通信中...")
-    
     api_host = "https://api.stability.ai"
     engine_id = "stable-diffusion-xl-1024-v1-0" 
     
     try:
         response = requests.post(
             f"{api_host}/v1/generation/{engine_id}/image-to-image",
-            headers={
-                "Accept": "application/json",
-                "Authorization": f"Bearer {key}"
-            },
-            files={
-                "init_image": image_bytes
-            },
+            headers={"Accept": "application/json", "Authorization": f"Bearer {key}"},
+            files={"init_image": image_bytes},
             data={
                 "image_strength": 0.5, 
                 "init_image_mode": "IMAGE_STRENGTH",
@@ -126,16 +136,12 @@ def generate_castle_image(image_bytes, prompt, key):
                 "steps": 30,
             }
         )
-
         if response.status_code != 200:
             st.error(f"APIエラーが発生しました: {response.status_code} - {response.text}")
             return None
-
         data = response.json()
         import base64
-        generated_bytes = base64.b64decode(data["artifacts"][0]["base64"])
-        return generated_bytes
-
+        return base64.b64decode(data["artifacts"][0]["base64"])
     except Exception as e:
         st.error(f"通信中にエラーが発生しました: {e}")
         return None
@@ -152,6 +158,7 @@ if "nodes" not in st.session_state:
     st.session_state.selected_end_type = "start"
     st.session_state.preview_new_target = None
     
+    # 最初はランダムに3本のひもを掛ける
     for _ in range(3):
         update_next_nodes()
         if st.session_state.next_nodes is not None:
@@ -197,35 +204,52 @@ if st.session_state.app_phase == "building":
                     n2["y"] += dy * diff * stiffness
 
     fig, ax = plt.subplots(figsize=(8, 8))
-    ax.scatter([p["x"] for p in anchors], [0]*5, color="#FF4B4B", s=150, zorder=10)
+    # 天井の点を描画
+    ax.scatter([p["x"] for p in anchors], [0]*NUM_ANCHORS, color="#555555", s=100, zorder=10)
 
     selected_s_data = None
     if st.session_state.selected_string_id is not None and "string_data" in st.session_state:
          selected_s_data = st.session_state.string_data[st.session_state.selected_string_id]
 
+    # 【改良】フォーカス方式の描画処理
     for l_idx, l in enumerate(links):
         if l == (0, 0, 0): continue 
         n1, n2 = nodes[l[0]], nodes[l[1]]
-        color = "black"
-        lw = 3
-        if selected_s_data:
-            if selected_s_data["first_link_idx"] <= l_idx <= selected_s_data["last_link_idx"]:
-                color = "#1C83E1" 
-                lw = 4
-        ax.plot([n1["x"], n2["x"]], [n1["y"], n2["y"]], color=color, lw=lw, solid_capstyle="round", zorder=5)
+        
+        s_data_for_link = None
+        for s in st.session_state.string_data:
+             if not s.get("is_deleted", False) and s["first_link_idx"] <= l_idx <= s["last_link_idx"]:
+                 s_data_for_link = s
+                 break
+        
+        # デフォルトは細くて目立たないグレー
+        color = "#C0C0C0" 
+        lw = 2
+        z_order = 4
+        
+        if s_data_for_link:
+            # 選択中のひもだけ、太い鮮やかな青色にして前面に持ってくる
+            if selected_s_data and s_data_for_link["id"] == selected_s_data["id"]:
+                color = "#1C83E1"
+                lw = 6
+                z_order = 6
+                
+        ax.plot([n1["x"], n2["x"]], [n1["y"], n2["y"]], color=color, lw=lw, solid_capstyle="round", zorder=z_order)
 
+    # プレビューの描画（現在の端＝オレンジ、新しい接続先＝緑）
     if selected_s_data and st.session_state.preview_new_target is not None:
         current_idx = selected_s_data["start_node"] if st.session_state.selected_end_type == "start" else selected_s_data["end_node"]
         curr_n = nodes[current_idx]
-        ax.scatter(curr_n["x"], curr_n["y"], color="white", edgecolor="#FF9F43", s=100, linewidth=2, zorder=12)
+        ax.scatter(curr_n["x"], curr_n["y"], color="none", edgecolor="#FF9F43", s=300, linewidth=3, zorder=12, label="現在の端")
+        
         new_n = nodes[st.session_state.preview_new_target]
-        ax.scatter(new_n["x"], new_n["y"], color="#29B09D", s=150, alpha=0.5, zorder=11)
+        ax.scatter(new_n["x"], new_n["y"], color="none", edgecolor="#32CD32", s=600, linewidth=4, linestyle="--", zorder=13, label="新しい接続先")
 
-    active_node_indices = set(range(5))
+    active_node_indices = set(range(NUM_ANCHORS))
     if "string_data" in st.session_state:
         for s in st.session_state.string_data:
             if not s.get("is_deleted", False):
-                base = 5 + s["id"] * NUM_INTERNAL_NODES
+                base = NUM_ANCHORS + s["id"] * NUM_INTERNAL_NODES
                 active_node_indices.update(range(base, base + NUM_INTERNAL_NODES))
 
     all_y = [nodes[i]["y"] for i in active_node_indices]
@@ -250,7 +274,7 @@ if st.session_state.app_phase == "building":
         st.subheader("➕ ひもを追加")
         if st.session_state.next_nodes is not None:
             i1, i2 = st.session_state.next_nodes
-            st.write(f"候補: ノード {i1} ↔ ノード {i2}")
+            st.write(f"候補: {format_node_label(i1)} ↔ {format_node_label(i2)}")
             if st.button("このひもを確定して次へ"):
                 add_string(i1, i2)
                 st.session_state.selected_string_id = None 
@@ -268,7 +292,12 @@ if st.session_state.app_phase == "building":
         st.subheader("⚙️ ひもの操作")
         active_strings = [s for s in st.session_state.string_data if not s.get("is_deleted", False)]
         if active_strings:
-            string_options = {f"ひも {s['id'] + 1}": s['id'] for s in active_strings}
+            # 【変更】シンプルな番号表記に戻す
+            string_options = {}
+            for s in active_strings:
+                label = f"ひも {s['id'] + 1}"
+                string_options[label] = s['id']
+                
             selected_string_label = st.selectbox("1. 操作するひもを選ぶ", list(string_options.keys()))
             s_id = string_options[selected_string_label]
             st.session_state.selected_string_id = s_id
@@ -281,11 +310,11 @@ if st.session_state.app_phase == "building":
             st.session_state.selected_end_type = type_key
             current_target = current_s_data["start_node"] if type_key == "start" else current_s_data["end_node"]
             
-            reconnect_cands = [0, 1, 2, 3, 4]
+            reconnect_cands = list(range(NUM_ANCHORS))
             for s in active_strings:
                 if s["id"] != s_id: 
-                    base = 5 + s["id"] * NUM_INTERNAL_NODES
-                    reconnect_cands.extend([base + 9, base + 19, base + 29])
+                    base = NUM_ANCHORS + s["id"] * NUM_INTERNAL_NODES
+                    reconnect_cands.append(base + MID_NODE_OFFSET)
             
             used_nodes = get_used_nodes()
             if current_target in used_nodes:
@@ -294,7 +323,7 @@ if st.session_state.app_phase == "building":
             available_reconnects = [c for c in reconnect_cands if c not in used_nodes]
             if available_reconnects:
                 default_idx = available_reconnects.index(current_target) if current_target in available_reconnects else 0
-                new_target = st.selectbox("新しい接続先ノード", available_reconnects, index=default_idx)
+                new_target = st.selectbox("新しい接続先", available_reconnects, index=default_idx, format_func=format_node_label)
                 st.session_state.preview_new_target = new_target
                 
                 if current_target != new_target:
@@ -318,7 +347,7 @@ if st.session_state.app_phase == "building":
             st.markdown("---")
             st.markdown("#### 🗑️ 削除する")
             deps = []
-            base = 5 + s_id * NUM_INTERNAL_NODES
+            base = NUM_ANCHORS + s_id * NUM_INTERNAL_NODES
             internal_nodes = set(range(base, base + NUM_INTERNAL_NODES))
             for s in active_strings:
                 if s["id"] == s_id: continue
@@ -354,19 +383,19 @@ elif st.session_state.app_phase == "generating":
     
     fig, ax = plt.subplots(figsize=(8, 8))
     
-    ax.scatter([p["x"] for p in anchors], [0]*5, color="gray", s=150, zorder=10)
+    ax.scatter([p["x"] for p in anchors], [0]*NUM_ANCHORS, color="gray", s=150, zorder=10)
     ax.plot([-20, 20], [0, 0], color="gray", lw=4, zorder=5)
 
     for l in links:
         if l == (0, 0, 0): continue 
         n1, n2 = nodes[l[0]], nodes[l[1]]
-        ax.plot([n1["x"], n2["x"]], [n1["y"], n2["y"]], color="black", lw=3, solid_capstyle="round", zorder=5)
+        ax.plot([n1["x"], n2["x"]], [n1["y"], n2["y"]], color="black", lw=4, solid_capstyle="round", zorder=5)
 
-    active_node_indices = set(range(5))
+    active_node_indices = set(range(NUM_ANCHORS))
     if "string_data" in st.session_state:
         for s in st.session_state.string_data:
             if not s.get("is_deleted", False):
-                base = 5 + s["id"] * NUM_INTERNAL_NODES
+                base = NUM_ANCHORS + s["id"] * NUM_INTERNAL_NODES
                 active_node_indices.update(range(base, base + NUM_INTERNAL_NODES))
 
     all_y = [nodes[i]["y"] for i in active_node_indices]
@@ -374,7 +403,6 @@ elif st.session_state.app_phase == "generating":
     bottom_limit = min_y - 5.0
     half_width = max(20.0, abs(bottom_limit) * 0.8)
 
-    # 上下反転のトリック
     ax.set_ylim(5, bottom_limit) 
     ax.set_xlim(-half_width, half_width)
     ax.axis("off")
@@ -383,7 +411,6 @@ elif st.session_state.app_phase == "generating":
     fig.savefig(buf, format="png", bbox_inches='tight', dpi=150)
     buf.seek(0)
     
-    # Stability AI仕様の 1024x1024 リサイズ
     raw_img = Image.open(buf)
     resized_img = raw_img.resize((1024, 1024), Image.LANCZOS)
     out_buf = io.BytesIO()
